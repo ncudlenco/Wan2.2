@@ -4,4 +4,38 @@ __pycache__/
 tmp_examples*
 new_checkpoint*
 batch_test*
-nohup*
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Model downloads and outputs
+Wan2.2-*/
+*.mp4
+*.log
+download_model.py
+
+# Python artifacts
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Generated files
+generation_output*.log
+=*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model outputs
+Wan2.2-*/
+*.mp4
+*.log
+download_model.py
+generation_output*.log
