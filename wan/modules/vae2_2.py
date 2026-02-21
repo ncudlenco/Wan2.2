@@ -1039,7 +1039,9 @@ class Wan2_2_VAE:
         try:
             if not isinstance(zs, list):
                 raise TypeError("zs should be a list")
-            with amp.autocast(dtype=self.dtype):
+            # float16 halves intermediate memory (~976→488 MiB); output is
+            # cast to float32 by .float() below so final quality is unchanged.
+            with amp.autocast(dtype=torch.float16):
                 return [
                     self.model.decode(u.unsqueeze(0),
                                       self.scale).float().clamp_(-1,

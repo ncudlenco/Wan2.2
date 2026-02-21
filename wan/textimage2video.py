@@ -280,6 +280,14 @@ class WanTI2V:
                 - H: Frame height (from size)
                 - W: Frame width from size)
         """
+        # Restore FSDP DiT shards to GPU if previously offloaded (between videos)
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        for m in self.model.modules():
+            if isinstance(m, FSDP):
+                fp = m._flat_param
+                if fp is not None and fp.device.type == 'cpu':
+                    fp.data = fp.data.to(self.device)
+
         # preprocess
         F = frame_num
         target_shape = (self.vae.model.z_dim, (F - 1) // self.vae_stride[0] + 1,
@@ -394,7 +402,17 @@ class WanTI2V:
                 latents = [temp_x0.squeeze(0)]
             x0 = latents
             if offload_model:
-                self.model.cpu()
+                # FSDP ignores .cpu(); move each shard's flat_param to CPU explicitly
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                _fsdp_done = False
+                for m in self.model.modules():
+                    if isinstance(m, FSDP):
+                        fp = m._flat_param
+                        if fp is not None:
+                            fp.data = fp.data.cpu()
+                            _fsdp_done = True
+                if not _fsdp_done:
+                    self.model.cpu()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             if self.rank == 0:
@@ -458,6 +476,14 @@ class WanTI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width (from max_area)
         """
+        # Restore FSDP DiT shards to GPU if previously offloaded (between videos)
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        for m in self.model.modules():
+            if isinstance(m, FSDP):
+                fp = m._flat_param
+                if fp is not None and fp.device.type == 'cpu':
+                    fp.data = fp.data.to(self.device)
+
         # preprocess
         ih, iw = img.height, img.width
         dh, dw = self.patch_size[1] * self.vae_stride[1], self.patch_size[
@@ -601,7 +627,17 @@ class WanTI2V:
                 del latent_model_input, timestep
 
             if offload_model:
-                self.model.cpu()
+                # FSDP ignores .cpu(); move each shard's flat_param to CPU explicitly
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                _fsdp_done = False
+                for m in self.model.modules():
+                    if isinstance(m, FSDP):
+                        fp = m._flat_param
+                        if fp is not None:
+                            fp.data = fp.data.cpu()
+                            _fsdp_done = True
+                if not _fsdp_done:
+                    self.model.cpu()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 

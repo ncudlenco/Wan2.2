@@ -166,14 +166,39 @@ def attention(
             warnings.warn(
                 'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
             )
-        attn_mask = None
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
+        # Keep input dtype (float16 on P100). Do NOT cast to bfloat16:
+        # bfloat16 causes PyTorch SDPA to select the math backend on sm_60
+        # (P100), which materialises the full O(N²) attention matrix and OOMs.
+        # float16 allows the memory-efficient backend (xFormers, O(N×block)).
+        out_dtype = q.dtype
+        # P100 mem-efficient SDPA requires float16/float32; cast bfloat16 → float16
+        compute_dtype = torch.float16 if q.dtype == torch.bfloat16 else q.dtype
+        q = q.transpose(1, 2).to(compute_dtype)  # [B, Nh, Lq, C]
+        k = k.transpose(1, 2).to(compute_dtype)
+        v = v.transpose(1, 2).to(compute_dtype)
 
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+        try:
+            # Disable autocast: the outer bfloat16 autocast context in
+            # textimage2video.py would re-cast our float16 q/k/v → bfloat16
+            # at the kernel boundary, causing mem-efficient to reject them.
+            # Force memory-efficient backend; disable flash (sm_80+) and math (OOM).
+            with torch.autocast(device_type='cuda', enabled=False), \
+                 torch.backends.cuda.sdp_kernel(
+                     enable_flash=False, enable_math=False, enable_mem_efficient=True):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, is_causal=causal, dropout_p=dropout_p)
+        except RuntimeError:
+            # Chunked attention fallback: processes Q in chunks to avoid
+            # materialising the full N×N matrix.  Each chunk is O(chunk×N).
+            chunk_size = 512
+            scale = (q.shape[-1] ** -0.5) if softmax_scale is None else softmax_scale
+            out = torch.zeros_like(q)
+            for i in range(0, q.shape[2], chunk_size):
+                q_chunk = q[:, :, i:i + chunk_size]           # [B, Nh, chunk, C]
+                scores = torch.matmul(q_chunk, k.transpose(-2, -1)) * scale  # [B, Nh, chunk, Lk]
+                scores = scores.softmax(dim=-1)
+                out[:, :, i:i + chunk_size] = torch.matmul(scores, v)
 
         out = out.transpose(1, 2).contiguous()
-        return out
+        return out.to(out_dtype)

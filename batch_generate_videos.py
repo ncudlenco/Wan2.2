@@ -15,6 +15,7 @@ from datetime import datetime
 import traceback
 
 import torch
+import torch.distributed as dist
 from PIL import Image
 import cv2
 import numpy as np
@@ -253,21 +254,22 @@ def find_reference_image(folder_path):
     return img
 
 
-def generate_video_for_folder(folder_path, description, pipeline, cfg, args):
+def generate_video_for_folder(folder_path, description, pipeline, cfg, args, rank=0):
     """
     Generate a video for a specific folder
-    
+
     Args:
         folder_path: Path to the folder
         description: Text description
         pipeline: Wan pipeline object (WanTI2V or WanT2V)
         cfg: Model config
         args: Arguments
+        rank: Process rank (0 for single-GPU or primary rank)
     """
     output_path = os.path.join(folder_path, "wan2.2.mp4")
-    
-    # Skip if already exists
-    if os.path.exists(output_path) and not args.overwrite:
+
+    # Skip if already exists (only check on rank 0 to avoid race)
+    if rank == 0 and os.path.exists(output_path) and not args.overwrite:
         logging.info(f"Skipping {folder_path} - video already exists")
         return True
     
@@ -329,16 +331,17 @@ def generate_video_for_folder(folder_path, description, pipeline, cfg, args):
         gen_time = time.time() - gen_start
         logging.info(f"Generation completed in {gen_time:.1f}s ({gen_time/60:.1f} minutes)")
         
-        # Save video
-        logging.info(f"Saving video to: {output_path}")
-        save_video(
-            tensor=video[None],
-            save_file=output_path,
-            fps=cfg.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1)
-        )
+        # Save video (only rank 0 writes to disk)
+        if rank == 0:
+            logging.info(f"Saving video to: {output_path}")
+            save_video(
+                tensor=video[None],
+                save_file=output_path,
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1)
+            )
         
         # Clean up (aggressive for low VRAM)
         del video
@@ -443,6 +446,12 @@ def main():
     
     # System arguments (optimized for 24GB GPU)
     parser.add_argument(
+        "--fp16",
+        action="store_true",
+        default=False,
+        help="Use FP16 instead of BF16 (required for GPUs without BF16 support, e.g. P100)"
+    )
+    parser.add_argument(
         "--offload_model",
         action="store_true",
         default=False,
@@ -485,6 +494,18 @@ def main():
         help="Maximum number of videos to generate (for testing)"
     )
     parser.add_argument(
+        "--shard_idx",
+        type=int,
+        default=0,
+        help="Index of this shard (0-based). Use with --num_shards to split work across parallel instances."
+    )
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Total number of parallel shards. E.g. 4 for 4 parallel instances each using 2 GPUs."
+    )
+    parser.add_argument(
         "--log_file",
         type=str,
         default="batch_generation.log",
@@ -492,9 +513,24 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    # Setup logging
-    setup_logging(args.log_file)
+
+    # --- Distributed setup (auto-detected from torchrun env vars) ---
+    is_dist = "LOCAL_RANK" in os.environ
+    if is_dist:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        device_id = local_rank
+    else:
+        rank, local_rank, world_size, device_id = 0, 0, 1, 0
+
+    # Only rank 0 logs to console/file
+    if rank == 0:
+        setup_logging(args.log_file)
+    else:
+        logging.disable(logging.CRITICAL)
     logging.info("="*80)
     logging.info("Starting batch video generation")
     logging.info(f"Dataset path: {args.dataset_path}")
@@ -511,20 +547,52 @@ def main():
         logging.error(f"Checkpoint directory does not exist: {args.ckpt_dir}")
         return
     
-    # Find all folders to process
-    logging.info("Scanning for folders with texts.json...")
-    folders_to_process = find_dataset_folders(
-        args.dataset_path, 
-        args.text_key,
-        max_limit=args.max_videos,  # Stop scanning early if limit is set
-        skip_existing=not args.overwrite  # Skip folders with existing videos unless overwrite
-    )
-    
+    # Find all folders to process (rank 0 only, then broadcast)
+    if rank == 0:
+        logging.info("Scanning for folders with texts.json...")
+        # Scan ALL folders (skip_existing=False) so the shard assignment is
+        # stable across restarts — completed videos shrink the list otherwise,
+        # shifting indices and causing overlaps / missed folders between machines.
+        all_folders = find_dataset_folders(
+            args.dataset_path,
+            args.text_key,
+            max_limit=None,
+            skip_existing=False
+        )
+        if not all_folders:
+            logging.warning("No folders found to process!")
+    else:
+        all_folders = None
+
+    if is_dist:
+        obj = [all_folders]
+        dist.broadcast_object_list(obj, src=0)
+        all_folders = obj[0]
+
+    # Shard the FULL stable list, then filter already-done within the shard
+    if args.num_shards > 1:
+        all_folders = all_folders[args.shard_idx::args.num_shards]
+        if rank == 0:
+            logging.info(f"Shard {args.shard_idx}/{args.num_shards}: {len(all_folders)} folders assigned")
+
+    if not args.overwrite:
+        folders_to_process = [
+            f for f in all_folders
+            if not os.path.exists(os.path.join(f[0], "wan2.2.mp4"))
+        ]
+    else:
+        folders_to_process = all_folders
+
+    if args.max_videos:
+        folders_to_process = folders_to_process[:args.max_videos]
+
     if not folders_to_process:
-        logging.warning("No folders found to process!")
+        if is_dist:
+            dist.destroy_process_group()
         return
-    
-    logging.info(f"Found {len(folders_to_process)} folders to process")
+
+    if rank == 0:
+        logging.info(f"Found {len(folders_to_process)} folders to process")
     
     # Initialize model
     logging.info("Initializing Wan2.2 pipeline...")
@@ -569,50 +637,40 @@ def main():
                 logging.info(f"Memory optimizations enabled (T5-CPU, model offloading, BF16) for {total_vram:.1f}GB VRAM")
     
     # Create pipeline
-    device_id = 0
-    rank = 0
-    
+    use_fsdp = world_size > 1
+    # P100 has no BF16 hardware support; --fp16 disables convert_model_dtype
+    convert_dtype = args.convert_model_dtype and not args.fp16
+    # NOTE: FSDP always uses param_dtype=bfloat16 (hardcoded in fsdp.py).
+    # On P100 both bfloat16 and float16 compute in float32; no perf difference.
+    # Do NOT set torch.set_default_dtype(float16) — it's a global side effect
+    # that doesn't change FSDP param_dtype but risks type mismatches elsewhere.
+    # Sequence parallel (use_sp) requires Flash Attention 2 (sm_80+).
+    # P100 is sm_60 so Flash Attn 2 is unavailable — disable sp on P100.
+    use_sp = use_fsdp and not args.fp16
+
+    pipeline_kwargs = dict(
+        config=cfg,
+        checkpoint_dir=args.ckpt_dir,
+        device_id=device_id,
+        rank=rank,
+        t5_fsdp=use_fsdp,
+        dit_fsdp=use_fsdp,
+        use_sp=use_sp,
+        t5_cpu=args.t5_cpu,
+        convert_model_dtype=convert_dtype,
+        init_on_cpu=True,
+    )
+
     if "ti2v" in args.task:
-        pipeline = wan.WanTI2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device_id,
-            rank=rank,
-            t5_fsdp=False,
-            dit_fsdp=False,
-            use_sp=False,
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-            init_on_cpu=True,
-        )
+        pipeline = wan.WanTI2V(**pipeline_kwargs)
     elif "t2v" in args.task:
-        pipeline = wan.WanT2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device_id,
-            rank=rank,
-            t5_fsdp=False,
-            dit_fsdp=False,
-            use_sp=False,
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-            init_on_cpu=True,
-        )
+        pipeline = wan.WanT2V(**pipeline_kwargs)
     elif "i2v" in args.task:
-        pipeline = wan.WanI2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device_id,
-            rank=rank,
-            t5_fsdp=False,
-            dit_fsdp=False,
-            use_sp=False,
-            t5_cpu=args.t5_cpu,
-            convert_model_dtype=args.convert_model_dtype,
-            init_on_cpu=True,
-        )
+        pipeline = wan.WanI2V(**pipeline_kwargs)
     else:
         logging.error(f"Unsupported task: {args.task}")
+        if is_dist:
+            dist.destroy_process_group()
         return
     
     logging.info("Pipeline initialized successfully")
@@ -627,7 +685,7 @@ def main():
         logging.info(f"{'='*80}")
         
         success = generate_video_for_folder(
-            folder_path, description, pipeline, cfg, args
+            folder_path, description, pipeline, cfg, args, rank=rank
         )
         
         if success:
@@ -638,12 +696,16 @@ def main():
         logging.info(f"Progress: {success_count} succeeded, {fail_count} failed")
     
     # Summary
-    logging.info("\n" + "="*80)
-    logging.info("BATCH GENERATION COMPLETE")
-    logging.info(f"Total folders processed: {len(folders_to_process)}")
-    logging.info(f"Successful: {success_count}")
-    logging.info(f"Failed: {fail_count}")
-    logging.info("="*80)
+    if rank == 0:
+        logging.info("\n" + "="*80)
+        logging.info("BATCH GENERATION COMPLETE")
+        logging.info(f"Total folders processed: {len(folders_to_process)}")
+        logging.info(f"Successful: {success_count}")
+        logging.info(f"Failed: {fail_count}")
+        logging.info("="*80)
+
+    if is_dist:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
